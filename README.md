@@ -1,8 +1,8 @@
-# Siem-Agent Agent
+# OpenSIEM Agent
 
-A lightweight, open-source Windows security event collection agent written in Go. It collects security telemetry from Windows hosts and forwards it to a centralized backend for storage and analysis.
+A lightweight, open-source Windows security event collection agent written in Go. Collects security telemetry from Windows hosts and forwards it to the OpenSIEM backend for centralized storage and analysis.
 
-> **Status:** v0.1.0 — agent + forwarder complete. Backend and frontend are in active development.
+**Version: v0.2.0** — agent fully operational with 10 active collectors.
 
 ---
 
@@ -17,7 +17,8 @@ A lightweight, open-source Windows security event collection agent written in Go
 - [TLS & Authentication](#tls--authentication)
 - [Running the Agent](#running-the-agent)
 - [Offline Buffering](#offline-buffering)
-- [Collected Event Types](#collected-event-types)
+- [Collectors](#collectors)
+- [Event Schema](#event-schema)
 - [Project Structure](#project-structure)
 - [Contributing](#contributing)
 - [License](#license)
@@ -26,15 +27,27 @@ A lightweight, open-source Windows security event collection agent written in Go
 
 ## Overview
 
-The Siem-Agent agent runs as a Windows Service on each host you want to monitor. It collects events from five sources, normalizes them into a common schema, and forwards them over HTTPS to the backend ingest API in batches.
+The OpenSIEM agent runs as a Windows Service on each host you want to monitor. It collects events from **ten independent sources**, normalises them into a common schema, rate-limits and deduplicates them, then forwards them over HTTPS to the backend ingest API in batches.
+
+**What the agent does:**
+
+- Parses every Windows Event Log entry into structured fields — user, domain, PID, process name, command line, IPs, ports, registry keys — extracted from the raw XML, not stored as a blob
+- Monitors process start and stop in real time via ETW, with automatic WMI polling fallback
+- Captures DNS queries and responses without requiring Sysmon, using the built-in Windows DNS-Client provider
+- Watches critical directories for file create, modify, delete, and rename events via `ReadDirectoryChangesW`
+- Tails any application log file and ships each new line — JSON fields auto-extracted, Apache/nginx combined format parsed automatically
+- Detects registry changes on high-value keys the moment they happen
+- Emits agent health heartbeats every 60 seconds so the backend always knows the agent is alive
+- Buffers all events to a durable disk queue and retries with exponential backoff if the backend is unreachable
+- Rate-limits and deduplicates per source to prevent log floods from filling the queue
 
 **Key properties:**
 
-- Single `.exe` binary — no runtime or installer dependencies
+- Single `.exe` binary — no runtime, no installer dependencies
 - Runs as a native Windows Service (auto-starts on boot)
-- Supports **mTLS** (mutual TLS) or **API key** authentication to the backend
-- **Durable offline queue** — events are buffered to disk and retried if the backend is unreachable
-- Zero external runtime dependencies — only two Go modules required (`golang.org/x/sys`, `gopkg.in/yaml.v3`)
+- mTLS or API key authentication
+- Zero data loss — durable disk queue survives agent and backend restarts
+- All collectors are independently enable/disable via `agent.yaml`
 
 ---
 
@@ -42,63 +55,71 @@ The Siem-Agent agent runs as a Windows Service on each host you want to monitor.
 
 ```
 Windows Host
-┌──────────────────────────────────────────────┐
-│                                              │
-│  Collectors                                  │
-│  ┌───────────┐  ┌────────┐  ┌──────────┐    │
-│  │ EventLog  │  │ Sysmon │  │ Network  │    │
-│  └─────┬─────┘  └───┬────┘  └────┬─────┘    │
-│        │            │            │           │
-│  ┌─────┴─────┐  ┌───┴────┐       │           │
-│  │ Registry  │  │Process │       │           │
-│  └─────┬─────┘  └───┬────┘       │           │
-│        └────────────┴────────────┘           │
-│                     │                        │
-│              event channel                   │
-│                     │                        │
-│             ┌───────▼────────┐               │
-│             │  Normalizer /  │               │
-│             │    Enricher    │               │
-│             └───────┬────────┘               │
-│                     │                        │
-│             ┌───────▼────────┐               │
-│             │  Disk Queue    │               │
-│             │ (JSONL files)  │               │
-│             └───────┬────────┘               │
-│                     │                        │
-│             ┌───────▼────────┐               │
-│             │ HTTP Forwarder │──────────────► Backend API
-│             │  (mTLS/HTTPS)  │   POST /api/v1/events
-│             └────────────────┘               │
-└──────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│  Collectors                                                 │
+│  ┌──────────┐ ┌────────┐ ┌─────────┐ ┌──────────────────┐  │
+│  │EventLog  │ │Sysmon  │ │Network  │ │     Process      │  │
+│  │Full XML  │ │17 IDs  │ │TCP diff │ │  ETW / WMI poll  │  │
+│  │field     │ │mapped  │ │iphlpapi │ │  fallback        │  │
+│  │extract   │ │        │ │         │ │                  │  │
+│  └────┬─────┘ └───┬────┘ └────┬────┘ └────────┬─────────┘  │
+│       │           │           │               │             │
+│  ┌────┴────┐ ┌────┴───┐ ┌─────┴────┐ ┌────────┴────────┐   │
+│  │Registry │ │  DNS   │ │   FIM    │ │     AppLog      │   │
+│  │RegNotify│ │DNS-    │ │ReadDir   │ │ tail any file   │   │
+│  │Change   │ │Client/ │ │Changes W │ │ json/text/      │   │
+│  │KeyValue │ │Operat. │ │          │ │ combined        │   │
+│  └────┬────┘ └────┬───┘ └─────┬────┘ └────────┬────────┘   │
+│       │           │           │               │             │
+│       └───────────┴─────┬─────┴───────────────┘             │
+│                         │                                   │
+│              ┌──────────▼──────────┐                        │
+│              │   Rate Limiter /    │  500 evt/s per source  │
+│              │   Deduplicator      │  5s dedupe window      │
+│              └──────────┬──────────┘                        │
+│                         │                                   │
+│              ┌──────────▼──────────┐                        │
+│              │  Normalizer /       │  field hygiene,        │
+│              │  Enricher           │  EventID → type/sev    │
+│              └──────────┬──────────┘                        │
+│                         │                                   │
+│              ┌──────────▼──────────┐                        │
+│              │  Disk Queue         │  JSONL segment files   │
+│              │                     │  survives restarts     │
+│              └──────────┬──────────┘                        │
+│                         │                                   │
+│              ┌──────────▼──────────┐                        │
+│              │  HTTP Forwarder     │──────────► Backend API │
+│              │  mTLS / API key     │  POST /api/v1/events   │
+│              └─────────────────────┘                        │
+│                                                             │
+│  Health Reporter ─────────────────────────────────────────► │
+│  60s heartbeat: queue depth, drops, memory, goroutines      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Events flow: **Collectors → Channel → Normalizer/Enricher → Disk Queue → HTTP Forwarder → Backend**
-
-The disk queue decouples collection from delivery — if the backend goes offline, events accumulate locally and are sent when the connection is restored.
+**Event pipeline:** Collectors → Rate Limiter → Normalizer/Enricher → Disk Queue → HTTP Forwarder → Backend
 
 ---
 
 ## Prerequisites
 
-### To build
-
-- [Go 1.22+](https://go.dev/dl/) installed on any OS (cross-compilation to Windows works from Linux/macOS)
+**To build:**
+- Go 1.22+
 - Git
 
-### To run
-
+**To run:**
 - Windows 10 / Windows Server 2016 or later (64-bit)
-- Administrator privileges (required for Event Log access, service installation, and registry watching)
-- [Sysmon](https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon) installed on the host if `collector.sysmon.enabled: true` (optional but recommended)
-- Network access from the host to the backend ingest URL
+- Administrator privileges (required for Event Log, ETW, service install, registry watching, FIM)
+- Sysmon installed only if `collector.sysmon.enabled: true` — all other collectors work without it
+- Outbound HTTPS access from the host to the backend ingest URL
 
 ---
 
 ## Building
 
-### Quick build (from Windows)
-
+**From Windows:**
 ```powershell
 git clone https://github.com/honbles/Seim-Agent.git
 cd Siem-Agent
@@ -106,156 +127,218 @@ go mod tidy
 go build -o agent.exe ./cmd/agent
 ```
 
-### Cross-compile from Linux or macOS
-
+**Cross-compile from Linux / macOS:**
 ```bash
-git clone https://github.com/honbles/Siem-Agent.git
+git clone https://github.com/honbles/Seim-Agent.git
 cd Siem-Agent
 go mod tidy
 GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
 ```
 
-### Build with version info embedded
-
+**With version info embedded:**
 ```bash
 GOOS=windows GOARCH=amd64 go build \
-  -ldflags="-X main.version=0.1.0 -s -w" \
+  -ldflags="-X main.version=0.2.0 -s -w" \
   -o agent.exe ./cmd/agent
 ```
-
-The `-s -w` flags strip debug info and reduce binary size.
 
 ---
 
 ## Installation
 
-### Option 1 — PowerShell installer (recommended)
-
-Copy `agent.exe` and `install.ps1` to the target host, then run from an elevated PowerShell prompt:
+**Install as a Windows Service (run as Administrator):**
 
 ```powershell
-# Install with a specific backend URL
-.\install.ps1 -Action install -BackendURL "https://siem.yourcompany.com:8443"
+# 1. Register the service
+.\agent.exe -config "C:\Program Files\OpenSIEM\Agent\agent.yaml" install
 
-# Install with a custom agent ID
-.\install.ps1 -Action install -BackendURL "https://siem.yourcompany.com:8443" -AgentID "workstation-01"
+# 2. Start it
+Start-Service OpenSIEMAgent
 
-# Install and generate a self-signed dev certificate
-.\install.ps1 -Action install -BackendURL "https://siem.yourcompany.com:8443" -GenerateCert
-
-# Check service status
-.\install.ps1 -Action status
-
-# Update binary only (stops service, replaces .exe, restarts)
-.\install.ps1 -Action update
-
-# Remove the service
-.\install.ps1 -Action uninstall
+# 3. Verify
+Get-Service OpenSIEMAgent
 ```
 
-The installer will:
-1. Create `C:\Program Files\Siem-Agent\Agent\` and `C:\ProgramData\Siem-Agent\`
-2. Copy `agent.exe` to the install directory
-3. Write `agent.yaml` with your backend URL
-4. Register the service with the Windows SCM (auto-start on boot)
-5. Configure 3-strike restart recovery
-6. Start the service immediately
+The service is registered with `StartAutomatic` — it starts on every boot.
 
-### Option 2 — Manual install
-
+**Service management:**
 ```powershell
-# 1. Copy files
-New-Item -ItemType Directory -Path "C:\Program Files\Siem-Agent\Agent"
-Copy-Item agent.exe "C:\Program Files\Siem-Agent\Agent\"
-Copy-Item configs\agent.yaml "C:\Program Files\Siem-Agent\Agent\"
+Start-Service   OpenSIEMAgent
+Stop-Service    OpenSIEMAgent
+Restart-Service OpenSIEMAgent
 
-# 2. Create data directory
-New-Item -ItemType Directory -Path "C:\ProgramData\Siem-Agent"
+# View logs written by the service
+Get-EventLog -LogName Application -Source OpenSIEMAgent -Newest 50
 
-# 3. Edit agent.yaml — set backend_url at minimum (see Configuration section)
-
-# 4. Register and start service (run as Administrator)
-& "C:\Program Files\Siem-Agent\Agent\agent.exe" -config "C:\Program Files\Siem-Agent\Agent\agent.yaml" install
-Start-Service Siem-AgentAgent
+# Remove the service
+.\agent.exe uninstall
 ```
 
 ---
 
 ## Configuration
 
-The agent is configured by a single YAML file. By default it looks for `agent.yaml` in the current directory. Override with the `-config` flag.
+The agent is configured by a single YAML file. Pass it with `-config`:
 
-### Full annotated `agent.yaml`
+```powershell
+.\agent.exe -config "C:\path\to\agent.yaml"
+```
+
+If `-config` is omitted the agent looks for `agent.yaml` in the current directory.
+
+### Full annotated agent.yaml
 
 ```yaml
 agent:
-  # Unique identifier for this agent instance.
+  # Unique identifier for this agent.
   # Leave empty to use the machine hostname (recommended).
   id: ""
-  version: "0.1.0"
+  version: "0.2.0"
 
 collector:
+
   event_log:
     enabled: true
     # Windows Event Log channels to subscribe to.
-    # Add any valid channel name (run: wevtutil el to list all).
+    # Run: wevtutil el   to list all available channels on your system.
     channels:
       - Security
       - System
       - Application
       - Microsoft-Windows-PowerShell/Operational
-    # How often to poll for new events.
     poll_interval: 5s
 
   sysmon:
-    # Requires Sysmon to be installed separately on the host.
+    # Requires Sysmon to be installed separately.
     # https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+    # If Sysmon is not installed this collector is skipped — no crash.
     enabled: true
 
   network:
     enabled: true
-    # How often to snapshot TCP connection table and emit deltas.
+    # How often to snapshot the TCP connection table and emit deltas.
     poll_interval: 30s
 
   process:
-    # ETW (Event Tracing for Windows) real-time process events.
+    # Real-time process start/stop via ETW (Kernel-Process provider).
+    # Automatically falls back to WMI/toolhelp polling if ETW fails.
     enabled: true
 
   registry:
     enabled: true
-    # Registry keys to watch for any change (key creation, deletion, value changes).
-    # Use HKLM, HKCU, HKCR, or HKU prefixes.
+    # Registry key subtrees to watch for any change (create/delete/modify).
+    # Supported prefixes: HKLM, HKCU, HKCR, HKU
     keys:
       - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
       - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce
       - HKLM\SYSTEM\CurrentControlSet\Services
       - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
 
+  # DNS query/response telemetry via Microsoft-Windows-DNS-Client/Operational.
+  # No Sysmon required. The agent auto-enables the channel if it is disabled.
+  dns:
+    enabled: true
+
+  # File Integrity Monitoring.
+  # Watches directories in real time for create, modify, delete, and rename.
+  # Uses ReadDirectoryChangesW — no polling, true real-time notification.
+  fim:
+    enabled: true
+    dirs:
+      - path: "C:\\Windows\\System32"
+        recursive: false
+        # Glob patterns to exclude (matched against full path, case-insensitive)
+        exclude:
+          - "*.log"
+          - "*.tmp"
+          - "*.etl"
+      - path: "C:\\Windows\\SysWOW64"
+        recursive: false
+        exclude:
+          - "*.log"
+          - "*.tmp"
+          - "*.etl"
+      # Add your own sensitive directories:
+      # - path: "C:\\inetpub\\wwwroot"
+      #   recursive: true
+      #   exclude: []
+
+  # Agent health heartbeat.
+  # Emits a health event at each interval containing:
+  #   uptime, agent version, active collectors, events collected/dropped/
+  #   forwarded, queue depth, memory usage (MB), goroutine count.
+  health:
+    enabled: true
+    interval: 60s
+
+  # Per-source rate limiting and deduplication.
+  # Prevents a noisy source from flooding the queue and backend.
+  # Applied after collection, before the normalizer.
+  rate_limit:
+    enabled: true
+    max_per_second: 500   # max events/sec per (event_type + source) key
+    dedupe_window: 5s     # suppress duplicate event IDs within this window
+
+  # Application log tailing.
+  # Tails any log file and ships each new line as a SIEM event.
+  # The byte offset is saved to disk and resumed after agent restart.
+  # Log rotation is handled automatically (reopen from 0 if file shrinks).
+  #
+  # format:
+  #   json     — extracts: time, level→severity, user, src_ip, dst_ip,
+  #              port, process, pid. All other fields stored in Raw.
+  #   text     — each line stored verbatim in Raw.
+  #   combined — Apache / nginx combined access log. Extracts: src_ip,
+  #              method, path, status code, bytes, user agent.
+  #              HTTP 5xx → medium, 4xx → low.
+  #
+  # severity: 1=info  2=low  3=medium  4=high  5=critical
+  #   JSON logs with a level/severity field override this automatically.
+  app_logs: []
+
+  # Examples:
+  # app_logs:
+  #   - name: "my-api"
+  #     path: "C:\\logs\\my-api\\app.log"
+  #     format: "json"
+  #     event_type: "applog"
+  #     severity: 2
+  #
+  #   - name: "nginx-access"
+  #     path: "C:\\nginx\\logs\\access.log"
+  #     format: "combined"
+  #     event_type: "weblog"
+  #     severity: 1
+  #
+  #   - name: "worker"
+  #     path: "C:\\logs\\worker.log"
+  #     format: "text"
+  #     event_type: "applog"
+  #     severity: 1
+
 forwarder:
   # Full URL of the backend ingest API. Must include scheme and port.
   backend_url: "https://siem.yourcompany.com:8443"
 
-  # How many events to bundle into a single HTTP POST.
+  # Events to bundle into a single HTTP POST.
   batch_size: 200
 
   # Send a batch at this interval even if batch_size is not reached.
   flush_interval: 5s
 
-  # --- mTLS (recommended for production) ---
-  # Paths are relative to agent.yaml location, or use absolute paths.
-  cert_file: "certs/agent.crt"   # Agent's client certificate (PEM)
-  key_file:  "certs/agent.key"   # Agent's private key (PEM)
-  ca_file:   "certs/ca.crt"      # CA that signed the backend's server cert (PEM)
+  # mTLS (recommended for production).
+  cert_file: "certs/agent.crt"
+  key_file:  "certs/agent.key"
+  ca_file:   "certs/ca.crt"
 
-  # --- API key (simpler, use if not using mTLS) ---
-  # Comment out cert_file/key_file/ca_file above and uncomment this:
+  # API key auth — simpler alternative to mTLS.
+  # Remove cert_file / key_file above and uncomment:
   # api_key: "your-secret-key-here"
 
 queue:
-  # Directory where the offline event buffer is stored.
-  # The agent creates a segments/ subfolder here automatically.
-  db_path: "C:\\ProgramData\\Siem-Agent\\queue"
-  # Maximum number of buffered events before oldest are evicted.
+  # Directory for the offline event buffer.
+  db_path: "C:\\ProgramData\\OpenSIEM\\queue"
+  # Max buffered events before oldest are evicted (ring buffer).
   max_rows: 100000
 
 log:
@@ -263,82 +346,27 @@ log:
   format: "json"   # json  | text
 ```
 
-### Minimal config (API key auth, no mTLS)
-
-```yaml
-agent:
-  id: ""
-  version: "0.1.0"
-
-collector:
-  event_log:
-    enabled: true
-    channels: [Security, System, Application]
-    poll_interval: 5s
-  sysmon:
-    enabled: false
-  network:
-    enabled: true
-    poll_interval: 30s
-  process:
-    enabled: true
-  registry:
-    enabled: true
-    keys:
-      - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
-
-forwarder:
-  backend_url: "https://siem.yourcompany.com:8443"
-  batch_size: 200
-  flush_interval: 5s
-  api_key: "your-secret-key-here"
-
-queue:
-  db_path: "C:\\ProgramData\\Siem-Agent\\queue"
-  max_rows: 100000
-
-log:
-  level: "info"
-  format: "json"
-```
-
 ---
 
 ## TLS & Authentication
 
-The agent supports two transport authentication modes. You must configure one of them — the backend will reject unauthenticated requests.
+### Mode 1 — Mutual TLS (mTLS) — Recommended
 
-### Mode 1 — Mutual TLS (mTLS) — Recommended for Production
+Both the agent and backend present certificates. The agent verifies it is talking to the real backend; the backend verifies the agent is enrolled.
 
-With mTLS, both the agent (client) and the backend (server) present certificates. This means:
-
-- The agent verifies the backend is legitimate (prevents sending data to a fake server)
-- The backend verifies the agent is enrolled (prevents rogue agents from injecting events)
-
-#### Step 1 — Create a Certificate Authority (do this once on the backend server)
-
+**Step 1 — Create a Certificate Authority (once, on the backend server):**
 ```bash
-# Generate CA private key
 openssl genrsa -out ca.key 4096
-
-# Generate self-signed CA certificate (valid 10 years)
 openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
-  -subj "/C=US/O=Siem-Agent/CN=Siem-Agent-CA"
+  -subj "/C=US/O=OpenSIEM/CN=OpenSIEM-CA"
 ```
 
-Keep `ca.key` private and secure. `ca.crt` is distributed to all agents.
-
-#### Step 2 — Create the backend server certificate (do this once)
-
+**Step 2 — Create the backend server certificate:**
 ```bash
-# Generate backend private key
 openssl genrsa -out server.key 2048
-
-# Generate CSR
 openssl req -new -key server.key -out server.csr \
-  -subj "/C=US/O=Siem-Agent/CN=siem.yourcompany.com"
+  -subj "/C=US/O=OpenSIEM/CN=siem.yourcompany.com"
 
-# Sign with your CA — include the backend's hostname/IP in the SAN
 cat > server-ext.cnf << EOF
 [req]
 req_extensions = v3_req
@@ -353,36 +381,27 @@ openssl x509 -req -days 825 -in server.csr -CA ca.crt -CAkey ca.key \
   -CAcreateserial -out server.crt -extfile server-ext.cnf -extensions v3_req
 ```
 
-Install `server.crt` and `server.key` on the backend server.
-
-#### Step 3 — Create a certificate for each agent
-
+**Step 3 — Create a certificate per agent host:**
 ```bash
-# Replace HOSTNAME with the actual machine name
 HOSTNAME="workstation-01"
-
 openssl genrsa -out ${HOSTNAME}.key 2048
-
 openssl req -new -key ${HOSTNAME}.key -out ${HOSTNAME}.csr \
-  -subj "/C=US/O=Siem-Agent/CN=${HOSTNAME}"
-
+  -subj "/C=US/O=OpenSIEM/CN=${HOSTNAME}"
 openssl x509 -req -days 825 -in ${HOSTNAME}.csr \
-  -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out ${HOSTNAME}.crt
+  -CA ca.crt -CAkey ca.key -CAcreateserial -out ${HOSTNAME}.crt
 ```
 
-#### Step 4 — Deploy certs to the agent host
+**Step 4 — Deploy to the Windows host:**
 
-Copy these three files to `C:\Program Files\Siem-Agent\Agent\certs\` on the Windows host:
+Copy to `C:\Program Files\OpenSIEM\Agent\certs\`:
 
 | File | What it is |
 |---|---|
-| `agent.crt` | The agent's client certificate (rename from `HOSTNAME.crt`) |
-| `agent.key` | The agent's private key (rename from `HOSTNAME.key`) |
-| `ca.crt` | Your CA certificate — used to verify the backend |
+| `agent.crt` | Agent client certificate (rename from `HOSTNAME.crt`) |
+| `agent.key` | Agent private key (rename from `HOSTNAME.key`) |
+| `ca.crt` | CA certificate — used to verify the backend |
 
-#### Step 5 — Update `agent.yaml`
-
+**Step 5 — agent.yaml:**
 ```yaml
 forwarder:
   backend_url: "https://siem.yourcompany.com:8443"
@@ -391,121 +410,49 @@ forwarder:
   ca_file:   "certs/ca.crt"
 ```
 
-Paths are relative to the location of `agent.yaml`. You can also use absolute paths:
-
-```yaml
-  cert_file: "C:\\Program Files\\Siem-Agent\\Agent\\certs\\agent.crt"
-  key_file:  "C:\\Program Files\\Siem-Agent\\Agent\\certs\\agent.key"
-  ca_file:   "C:\\Program Files\\Siem-Agent\\Agent\\certs\\ca.crt"
-```
-
 ---
 
-### Mode 2 — API Key Authentication (Simpler)
-
-If you don't want to manage certificates, use API key auth instead. Remove or comment out the `cert_file`, `key_file`, and `ca_file` fields and set `api_key`:
+### Mode 2 — API Key
 
 ```yaml
 forwarder:
   backend_url: "https://siem.yourcompany.com:8443"
+  ca_file: "certs/ca.crt"
   api_key: "your-secret-key-here"
 ```
 
-The agent will include this in every request as the `X-API-Key` HTTP header. The backend must validate this header.
-
-> **Note:** API key auth still requires HTTPS. Do not use `http://` in `backend_url` — your events and API key would be transmitted in plaintext.
-
----
-
-### Reaching the Backend — Network Requirements
-
-| Source | Destination | Port | Protocol |
-|---|---|---|---|
-| Windows host (agent) | Backend ingest server | 8443 (default) | HTTPS / HTTP/2 |
-
-If the host is behind a firewall, ensure outbound TCP port 8443 is open to the backend IP/hostname. The port is configurable — whatever port is in `backend_url` is what the agent connects to.
-
-**No inbound ports are needed on the Windows host** — the agent only makes outbound connections.
-
-#### DNS resolution
-
-Make sure the backend hostname in `backend_url` resolves from the Windows host:
-
-```powershell
-# Test from the Windows host
-Resolve-DnsName siem.yourcompany.com
-
-# Test connectivity
-Test-NetConnection -ComputerName siem.yourcompany.com -Port 8443
-```
-
-#### Testing the connection manually
-
-```powershell
-# Should return HTTP 200 or 401, not a connection error
-Invoke-WebRequest -Uri "https://siem.yourcompany.com:8443/api/v1/health" -SkipCertificateCheck
-```
+The key is sent as `X-API-Key` on every request. Always use `https://` — never plain `http://`.
 
 ---
 
 ## Running the Agent
 
-### As a Windows Service (normal operation)
-
-After installation the service runs automatically. To manage it:
-
+**Interactively (testing/debugging):**
 ```powershell
-# Check status
-Get-Service Siem-AgentAgent
-
-# Start / stop / restart
-Start-Service Siem-AgentAgent
-Stop-Service Siem-AgentAgent
-Restart-Service Siem-AgentAgent
-
-# View recent logs (Windows Event Log)
-Get-EventLog -LogName Application -Source Siem-AgentAgent -Newest 50
-```
-
-### Interactively (for testing and debugging)
-
-Run directly in a PowerShell terminal — logs print to stdout. Press `Ctrl+C` to stop.
-
-```powershell
-# Run with default config
-.\agent.exe -config agent.yaml
-
-# Run with debug logging
-# Edit agent.yaml: log.level = "debug"
 .\agent.exe -config agent.yaml
 ```
+Logs print to stdout. Set `log.level: debug` for per-event output. Press `Ctrl+C` to stop.
 
-### Service management commands
-
+**As a Windows Service:**
 ```powershell
-# Install service (must be run as Administrator)
-.\agent.exe -config "C:\Program Files\Siem-Agent\Agent\agent.yaml" install
+.\agent.exe -config "C:\Program Files\OpenSIEM\Agent\agent.yaml" install
+Start-Service OpenSIEMAgent
+Get-Service   OpenSIEMAgent
+```
 
-# Remove service
-.\agent.exe uninstall
+**Test backend connectivity:**
+```powershell
+Test-NetConnection -ComputerName siem.yourcompany.com -Port 8443
+Invoke-WebRequest -Uri "https://siem.yourcompany.com:8443/health" -SkipCertificateCheck
 ```
 
 ---
 
 ## Offline Buffering
 
-The agent uses a durable disk queue to prevent event loss when the backend is unreachable (network outage, backend restart, etc.).
+Events are written to JSONL segment files under `queue.db_path/segments/`. The forwarder reads them and POSTs to the backend. Failed POSTs are retried with exponential backoff and full jitter.
 
-**How it works:**
-
-1. Events are written to JSONL segment files in `queue.db_path/segments/`
-2. The HTTP forwarder reads from the queue and posts to the backend
-3. If a POST fails, events are re-queued and retried with exponential backoff
-4. If `max_rows` is exceeded, the oldest events are evicted (ring buffer)
-
-**Retry schedule** (exponential backoff with full jitter):
-
-| Attempt | Max wait before retry |
+| Attempt | Max wait |
 |---|---|
 | 1 | ~500ms |
 | 2 | ~1s |
@@ -516,32 +463,58 @@ The agent uses a durable disk queue to prevent event loss when the backend is un
 | 7 | ~32s |
 | 8 (final) | fail, re-queue |
 
-**Inspecting the queue:**
-
-The queue files are plain text and human-readable:
-
+**Inspect the queue:**
 ```powershell
-# See how many segment files exist
-Get-ChildItem "C:\ProgramData\Siem-Agent\queue\segments\"
+Get-ChildItem "C:\ProgramData\OpenSIEM\queue\segments\"
 
-# Read a segment (each line is one JSON event)
-Get-Content "C:\ProgramData\Siem-Agent\queue\segments\0000000001.jsonl" | 
+Get-Content "C:\ProgramData\OpenSIEM\queue\segments\0000000001.jsonl" |
   ConvertFrom-Json | Select-Object time, event_type, host | Format-Table
 ```
 
 ---
 
-## Collected Event Types
+## Collectors
 
-| Type | Source | What it captures |
+### Collector overview
+
+| Collector | Source | What it captures |
 |---|---|---|
-| `logon` | Windows Security log | Successful/failed logons (4624, 4625), admin logons (4672), explicit credentials (4648) |
-| `process` | Windows Security log + ETW | Process creation (4688) and termination (4689), command lines |
-| `network` | `iphlpapi.dll` snapshot | TCP connect/disconnect events with PID, src/dst IP and port |
-| `file` | Windows Security log | Object access (4663), file creation/deletion via Sysmon |
-| `registry` | `RegNotifyChangeKeyValue` | Changes to watched registry keys — creation, deletion, value modification |
-| `sysmon` | Sysmon Operational log | 17 high-value Sysmon event IDs — see table below |
-| `raw` | All channels | Any event not classified by the above rules |
+| **event_log** | wevtapi.dll | All configured Windows Event Log channels. Each event is fully XML-parsed: user, domain, PID, process name, command line, IP addresses, ports, registry key — extracted as individual schema fields, not raw XML. |
+| **sysmon** | Sysmon Operational | 17 high-value Sysmon event IDs mapped to enriched events. Requires Sysmon installed. |
+| **network** | iphlpapi.dll | TCP connection table snapshot every `poll_interval`. Emits connect/disconnect events with PID, src/dst IP and port. |
+| **process** | ETW Kernel-Process | Real-time process start and stop. Uses `StartTrace → EnableTraceEx2 → OpenTrace → ProcessTrace`. Falls back to `CreateToolhelp32Snapshot` polling if ETW is unavailable (e.g. insufficient privileges). |
+| **registry** | RegNotifyChangeKeyValue | Fires on any change to watched key subtrees — create, delete, or value modification. |
+| **dns** | DNS-Client/Operational | DNS query name, type, results, and status. No Sysmon required. Agent auto-enables the channel if it is disabled. |
+| **fim** | ReadDirectoryChangesW | File and directory create, modify, delete, rename in watched paths. Sensitivity-based severity — changes in System32 are rated High. |
+| **applog** | Any log file | Tails files from the last saved offset. JSON logs: extracts `time`, `level`, `user`, `src_ip`, `dst_ip`, `port`, `pid`, `process`. Combined logs: parses method, path, status, bytes, user agent. Text logs: stores lines verbatim. Handles rotation. |
+| **health** | Agent itself | Heartbeat every 60s: uptime, agent version, active collectors, events collected / dropped / forwarded, queue depth, memory (MB), goroutines. |
+| **rate_limit** | All sources | Wraps the collector pipeline. Drops events that exceed `max_per_second` per source, and suppresses duplicate event IDs within `dedupe_window`. |
+
+---
+
+### Windows Security Event IDs — detailed handling
+
+| Event ID | Description | event_type | Severity |
+|---|---|---|---|
+| 4624 | Successful logon | logon | Info (Low if network, Medium if RDP) |
+| 4625 | Failed logon | logon | Medium (High if remote network) |
+| 4634 / 4647 | Logoff | logon | Info |
+| 4648 | Explicit credentials used (runas / pass-the-hash indicator) | logon | Medium |
+| 4672 | Special privileges assigned (admin logon) | logon | Medium |
+| 4688 | Process creation | process | Low |
+| 4689 | Process termination | process | Info |
+| 4698 / 4702 | Scheduled task created / updated | process | High |
+| 4720 | User account created | logon | High |
+| 4728 / 4732 / 4756 | Member added to privileged group | logon | High |
+| 4657 | Registry value modified | registry | Medium |
+| 4660 | Object deleted | file | Medium |
+| 4663 | Object access | file | Low |
+| 4776 | NTLM credential validation | logon | Low |
+| 5156 | Windows Filtering Platform — connection permitted | network | Low |
+| 5157 | Windows Filtering Platform — connection blocked | network | Medium |
+| 7045 | New service installed | process | High |
+
+---
 
 ### Sysmon Event ID coverage
 
@@ -550,10 +523,10 @@ Get-Content "C:\ProgramData\Siem-Agent\queue\segments\0000000001.jsonl" |
 | 1 | ProcessCreate | Low |
 | 3 | NetworkConnect | Low |
 | 5 | ProcessTerminate | Info |
-| 6 | DriverLoad | **High** |
+| 6 | DriverLoad | High |
 | 7 | ImageLoad | Low |
-| 8 | CreateRemoteThread | **High** |
-| 9 | RawAccessRead | **High** |
+| 8 | CreateRemoteThread | High |
+| 9 | RawAccessRead | High |
 | 10 | ProcessAccess | Medium |
 | 11 | FileCreate | Low |
 | 12 | RegistryCreate | Low |
@@ -565,15 +538,55 @@ Get-Content "C:\ProgramData\Siem-Agent\queue\segments\0000000001.jsonl" |
 | 22 | DNSQuery | Low |
 | 23 | FileDeleteDetected | Medium |
 
+---
+
 ### Severity scale
 
-| Value | Label | Meaning |
+| Value | Label | Examples |
 |---|---|---|
-| 1 | Info | Routine — logoff, process exit |
-| 2 | Low | Normal activity — new connection, file create |
-| 3 | Medium | Worth reviewing — failed logon, registry change |
-| 4 | High | Investigate promptly — remote thread, driver load, account created |
-| 5 | Critical | Immediate attention — Windows Critical level events |
+| 1 | Info | Logoff, process exit, DNS cache hit, health heartbeat |
+| 2 | Low | New TCP connection, file create, DNS query, process start |
+| 3 | Medium | Failed logon, registry change, firewall block, RDP logon |
+| 4 | High | Remote thread injection, driver load, new service, account created, group membership change, scheduled task |
+| 5 | Critical | Windows Critical level events |
+
+---
+
+### Event schema fields
+
+Every event carries these fields regardless of source:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Deterministic SHA-256 derived dedup key |
+| `time` | RFC3339 | Event timestamp (UTC) |
+| `agent_id` | string | Agent identifier (hostname or configured ID) |
+| `host` | string | Hostname of the collecting machine |
+| `os` | string | `windows` |
+| `event_type` | string | `logon` `process` `network` `registry` `file` `sysmon` `dns` `applog` `health` `raw` |
+| `severity` | int | 1–5 |
+| `source` | string | Channel or provider name |
+| `raw` | JSON | Full original payload for forensic fidelity |
+| `event_id` | uint32 | Windows Event ID (where applicable) |
+| `channel` | string | Event Log channel name |
+| `user_name` | string | Subject or target user |
+| `domain` | string | Subject or target domain |
+| `logon_id` | string | Logon session ID |
+| `pid` | int | Process ID |
+| `ppid` | int | Parent process ID |
+| `process_name` | string | Process image name |
+| `command_line` | string | Full command line (truncated at 4096 chars) |
+| `image_path` | string | Full path to process image |
+| `src_ip` | string | Source IP address |
+| `src_port` | int | Source port |
+| `dst_ip` | string | Destination IP address (or queried DNS hostname) |
+| `dst_port` | int | Destination port |
+| `proto` | string | `tcp` `udp` `icmp` |
+| `reg_key` | string | Registry key path |
+| `reg_value` | string | Registry value name |
+| `reg_data` | string | New registry value data |
+| `file_path` | string | File or object path |
+| `file_hash` | string | File hash (where available) |
 
 ---
 
@@ -583,31 +596,33 @@ Get-Content "C:\ProgramData\Siem-Agent\queue\segments\0000000001.jsonl" |
 agent/
 ├── cmd/
 │   └── agent/
-│       └── main.go           # Entry point; Windows service registration
+│       └── main.go                  # Entry point, Windows service wiring, collector startup
 ├── internal/
 │   ├── collector/
-│   │   ├── eventlog.go       # Subscribes to Windows Event Log channels (wevtapi.dll)
-│   │   ├── sysmon.go         # Reads Microsoft-Windows-Sysmon/Operational channel
-│   │   ├── network.go        # Snapshots TCP table via iphlpapi.dll, emits deltas
-│   │   ├── process.go        # ETW Kernel-Process provider (process start/stop)
-│   │   └── registry.go       # Watches registry keys via RegNotifyChangeKeyValue
+│   │   ├── eventlog.go              # Windows Event Log — full XML parse, all fields extracted
+│   │   ├── sysmon.go                # Sysmon Operational channel — 17 event IDs mapped
+│   │   ├── network.go               # TCP table snapshot via iphlpapi.dll — connect/disconnect diffs
+│   │   ├── process.go               # ETW Kernel-Process — real-time start/stop, WMI fallback
+│   │   ├── registry.go              # Registry watcher via RegNotifyChangeKeyValue
+│   │   ├── dns.go                   # DNS-Client/Operational — query/response telemetry
+│   │   ├── fim.go                   # File Integrity Monitoring via ReadDirectoryChangesW
+│   │   ├── applog.go                # Application log tailer — json / text / combined formats
+│   │   ├── health.go                # Agent health heartbeat reporter
+│   │   └── ratelimit.go             # Per-source rate limiter and deduplicator
 │   ├── parser/
-│   │   ├── normalizer.go     # Validates + classifies events; maps EventIDs to types
-│   │   └── enricher.go       # Stamps agent ID, hostname, deterministic dedup ID
+│   │   ├── normalizer.go            # Field hygiene, EventID → type/severity classification
+│   │   └── enricher.go              # Agent ID, hostname, deterministic dedup ID
 │   ├── forwarder/
-│   │   ├── http.go           # HTTP/2 + mTLS batch forwarder
-│   │   ├── queue.go          # Durable JSONL segment queue (stdlib only)
-│   │   └── retry.go          # Exponential backoff with full jitter
+│   │   ├── http.go                  # HTTP/2 + mTLS batched forwarder
+│   │   ├── queue.go                 # Durable JSONL segment queue (stdlib only, no SQLite)
+│   │   └── retry.go                 # Exponential backoff with full jitter
 │   └── config/
-│       └── config.go         # YAML config loader with defaults and validation
+│       └── config.go                # YAML config loader, struct definitions, defaults, validation
 ├── pkg/
 │   └── schema/
-│       └── event.go          # Shared Event and Batch types (JSON schema)
+│       └── event.go                 # Shared Event and Batch types (single source of truth)
 ├── configs/
-│   └── agent.yaml            # Default configuration template
-├── build/
-│   └── windows/
-│       └── install.ps1       # PowerShell service installer
+│   └── agent.yaml                   # Default configuration template
 └── go.mod
 ```
 
@@ -615,31 +630,10 @@ agent/
 
 ## Contributing
 
-Contributions are welcome! Please open an issue before submitting a large PR so we can discuss the approach.
-
-**Good first issues:**
-- Complete the ETW process collector (`process.go` has the structure stubbed out — full Win32 interop needed)
-- Add XML parsing in `eventlog.go` to extract structured fields from the raw XML payload
-- Add a `--dry-run` flag that prints events to stdout instead of forwarding
-- Write unit tests for the normalizer and enricher
-- Add a Sysmon configuration template (`sysmon-config.xml`) to the repo
-
-**Development setup:**
-
-```bash
-git clone https://github.com/honbles/Siem-Agent.git
-cd Siem-Agent/agent
-go mod tidy
-
-# Run tests
-go test ./...
-
-# Build for Windows from Linux/Mac
-GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.

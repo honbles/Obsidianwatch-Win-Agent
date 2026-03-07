@@ -1,90 +1,132 @@
-# Contributing to OpenSIEM
+# Contributing to OpenSIEM Agent
 
-Thank you for your interest in contributing. OpenSIEM is an early-stage open source project and contributions of all kinds are welcome — code, documentation, bug reports, and ideas.
-
----
-
-## Before you start
-
-- Open an **issue** before working on a large feature or refactor so we can discuss the approach and avoid duplicated effort
-- For small bug fixes, typos, or documentation improvements — just open a PR directly
+Thank you for your interest in contributing. This document covers how to set up a development environment, the project conventions, and how to submit a change.
 
 ---
 
-## Development setup
+## Development Setup
 
 ```bash
-git clone https://github.com/YOUR_ORG/opensiem.git
-cd opensiem/agent
-
-# Download dependencies
+git clone https://github.com/honbles/Seim-Agent.git
+cd Siem-Agent
 go mod tidy
+
+# Verify everything compiles (run from repo root)
+go build ./...
 
 # Run tests
 go test ./...
 
-# Build for Windows from Linux/Mac
+# Cross-compile for Windows from Linux/macOS
 GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
-
-# Build and run on Windows
-go build -o agent.exe ./cmd/agent
-.\agent.exe -config configs\agent.yaml
 ```
 
-**Requirements:** Go 1.22+. No other tools needed.
+> **Note:** Most collector files carry a `//go:build windows` constraint because they use Windows-only syscalls (`wevtapi.dll`, `iphlpapi.dll`, ETW, etc.). `go build ./...` still compile-checks all packages regardless of the platform you run it on.
+
+> **Important:** The `//go:build windows` directive **must be the absolute first line** of the file — before `package`, before any comments. A misplaced directive causes a compiler error.
 
 ---
 
-## Good first contributions
+## Project Layout
 
-These are well-scoped tasks that don't require deep Windows internals knowledge:
-
-- **Complete XML parsing in `eventlog.go`** — the raw XML from `EvtRender` is stored as-is in `RawXML`. Add proper XML parsing to extract `EventID`, `TimeCreated`, `Computer`, `UserID`, and `EventData` fields into the `rawWinEvent` struct.
-
-- **Complete ETW process collector** — `process.go` has the session structure in place. Full Win32 interop to call `StartTrace`, `EnableTraceEx2`, `OpenTrace`, and `ProcessTrace` is needed. See comments in the file. The `github.com/bi-zone/etw` package is an option if you want to avoid raw CGO.
-
-- **Add `--dry-run` flag** — print events as JSON to stdout instead of forwarding to the backend. Useful for testing collector configuration without a backend.
-
-- **Add a `--validate-config` flag** — load and validate `agent.yaml` then exit, reporting any errors. Useful for CI and deployment pipelines.
-
-- **Write unit tests for the normalizer** — `internal/parser/normalizer.go` has no tests. Test EventID classification, severity adjustment, string sanitization, and truncation.
-
-- **Write unit tests for the queue** — `internal/forwarder/queue.go` has no tests. Test Push/Pop ordering, eviction when full, recovery after a crash (queue files left on disk).
-
-- **Add a Sysmon config template** — provide a recommended `sysmon-config.xml` in `configs/` or `docs/` that works well with OpenSIEM's event coverage.
-
-- **Windows Firewall audit collector** — add a collector that reads from `Microsoft-Windows-Windows Firewall With Advanced Security/Firewall` to capture blocked connections.
+```
+agent/
+├── cmd/agent/main.go            # Entry point and collector wiring
+├── internal/collector/          # One file per event source
+├── internal/parser/             # Normalizer and enricher
+├── internal/forwarder/          # HTTP forwarder, disk queue, retry
+├── internal/config/             # YAML config loader
+└── pkg/schema/event.go          # Shared Event / Batch types
+```
 
 ---
 
-## Code style
+## Adding a New Collector
 
-- Follow standard Go conventions (`gofmt`, `go vet`)
-- Keep files focused — one collector per file
-- Add a comment block at the top of each new file explaining what it does (see existing files for the pattern)
-- New collectors must implement `Run(ctx context.Context) error` and emit `schema.Event` values on a channel
-- Use `//go:build windows` as the first line of any file that uses Windows-specific APIs
-- Do not introduce new external dependencies without discussing in an issue first — the goal is to keep the dependency footprint minimal
-
----
-
-## Submitting a PR
-
-1. Fork the repo and create a branch: `git checkout -b feature/your-feature`
-2. Make your changes
-3. Run `go test ./...` and `go vet ./...` — both must pass
-4. Run `GOOS=windows GOARCH=amd64 go build ./cmd/agent` — must compile without errors
-5. Commit with a clear message: `feat: add XML parsing for EventLog collector`
-6. Push and open a PR against `main`
+1. Create `internal/collector/yourcollector.go` with `//go:build windows` as the first line.
+2. Define a struct with at minimum `agentID`, `host string`, `out chan<- schema.Event`, and `*slog.Logger`.
+3. Implement `Run(ctx context.Context) error` — block until `ctx` is cancelled.
+4. Always send to the output channel with a non-blocking guard:
+   ```go
+   select {
+   case c.out <- ev:
+   default:
+       c.logger.Warn("yourcollector: out channel full, dropping event")
+   }
+   ```
+5. Add a config struct to `internal/config/config.go` under `CollectorConfig` with an `Enabled bool` field.
+6. Add the config section to `configs/agent.yaml` with sensible defaults and comments.
+7. Wire the collector in `cmd/agent/main.go` inside the `run()` function, appending its name to `activeCollectors`.
+8. If the collector introduces a new `EventType`, add the constant to `pkg/schema/event.go`.
 
 ---
 
-## Reporting bugs
+## Adding a New Event Type
+
+Edit `pkg/schema/event.go` and add to the const block:
+
+```go
+const (
+    // existing types ...
+    EventTypeYourType EventType = "yourtype"
+)
+```
+
+Then add classification logic in `internal/parser/normalizer.go`:
+- `classifyByEventID()` — map Windows Event IDs to your new type
+- `adjustSeverityByEventID()` — assign severity overrides for specific Event IDs
+
+---
+
+## Code Style
+
+- Format with `gofmt -w .` before committing — unformatted code will not be merged.
+- All exported types and functions must have a doc comment.
+- Use `slog` for all logging at the appropriate level:
+  - `Debug` — per-event detail, field values, parsing steps
+  - `Info` — collector start/stop, service lifecycle
+  - `Warn` — recoverable errors (channel full, single event parse failure)
+  - `Error` — fatal collector failures that cause `Run()` to return
+- Group imports: stdlib → external packages → internal (`opensiem/agent/...`).
+- Do not use `panic` in collectors — return errors or log and continue.
+
+---
+
+## Pull Request Process
+
+1. Open an issue first for any significant change so the approach can be discussed before you invest time writing it.
+2. Fork the repo and create a feature branch: `git checkout -b feat/your-feature`.
+3. Keep commits focused — one logical change per commit with a descriptive message.
+4. Update `configs/agent.yaml` and `README.md` if your change adds or modifies any configuration.
+5. Run `go build ./...` and `go test ./...` before pushing — PRs that do not compile will not be reviewed.
+6. Open the pull request against `main` with a clear description of what changed and why.
+
+---
+
+## Good First Issues
+
+- Write unit tests for `internal/parser/normalizer.go` and `internal/parser/enricher.go`
+- Add a `--dry-run` flag that prints events to stdout instead of forwarding to the backend
+- Add IPv6 support to the network collector (`GetExtendedTcpTable` with `AF_INET6`)
+- Add a Sysmon configuration template (`configs/sysmon-config.xml`) with recommended settings
+- Write a PowerShell deployment script that copies the binary and config to remote hosts over WinRM
+- Add SHA-256 file hashing to the FIM collector on create/modify events
+- Add applog include/exclude filter patterns (only ship lines matching a regex)
+
+---
+
+## Reporting Bugs
 
 Open a GitHub issue with:
 
-- Windows version (`winver` or `[System.Environment]::OSVersion`)
-- Go version (`go version`)
-- The relevant section of `agent.yaml` (redact any secrets)
-- The log output around the error (set `log.level: debug`)
-- What you expected to happen vs. what actually happened
+- Windows version (`winver` output)
+- Go version (`go version` output)
+- The relevant section of `agent.yaml` (redact any keys or URLs)
+- Log output around the error — set `log.level: debug` for full detail
+- Steps to reproduce
+
+---
+
+## License
+
+By contributing you agree that your contributions will be licensed under the [MIT License](LICENSE).
