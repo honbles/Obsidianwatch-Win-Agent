@@ -95,6 +95,7 @@ type RateLimitConfig struct {
 }
 
 type ForwarderConfig struct {
+	InstallKey string `yaml:"install_key"`  // tamper protection key
 	BackendURL    string        `yaml:"backend_url"`
 	BatchSize     int           `yaml:"batch_size"`
 	FlushInterval time.Duration `yaml:"flush_interval"`

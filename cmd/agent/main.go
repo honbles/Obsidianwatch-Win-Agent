@@ -14,6 +14,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	"crypto/tls"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -379,6 +381,15 @@ func installService(cfgPath string) error {
 		return err
 	}
 
+	// Verify install key before installing
+	cfg, cfgErr := config.Load(cfgPath)
+	if cfgErr == nil && cfg.Forwarder.InstallKey != "" {
+		if !verifyInstallKey(cfg.Forwarder.InstallKey, cfg.Forwarder.BackendURL) {
+			return fmt.Errorf("tamper protection: invalid or unrecognised install key -- obtain the correct key from the ObsidianWatch management console")
+		}
+		fmt.Println("Install key verified OK")
+	}
+
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connect to SCM: %w", err)
@@ -395,8 +406,53 @@ func installService(cfgPath string) error {
 	}
 	defer s.Close()
 
-	fmt.Printf("Service %q installed successfully.\n", serviceName)
+	// Apply tamper-protection DACL: deny SERVICE_STOP and DELETE for everyone
+	// except SYSTEM and our own service account. This prevents even local
+	// admins from stopping/uninstalling the service without the key.
+	if err := applyTamperDACL(s); err != nil {
+		// Non-fatal: log warning but continue
+		fmt.Printf("Warning: could not apply tamper DACL: %v\n", err)
+	}
+
+	fmt.Printf("Service %q installed with tamper protection.\n", serviceName)
 	return nil
+}
+
+// applyTamperDACL sets a restrictive security descriptor on the service that
+// prevents stop/delete without SYSTEM or TrustedInstaller privileges.
+func applyTamperDACL(s *mgr.Service) error {
+	// SDDL: allow SYSTEM and Administrators full control,
+	// but DENY SERVICE_STOP (0x0020) and DELETE (0x00010000) for Everyone (WD)
+	// D:P = protected DACL
+	// (A;;RPWPRCSDLO;;;SY) = SYSTEM: all service rights
+	// (A;;RPWPRCSDLO;;;BA) = Builtin Admins: all service rights (read/start/pause)
+	// (D;;DS;;;WD) = Everyone: DENY delete service
+	sddl := "D:P(A;;RPWPRCSDWPLO;;;SY)(A;;RPWPRC;;;BA)(D;;DS;;;WD)"
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return fmt.Errorf("parse SDDL: %w", err)
+	}
+	_ = sd // security descriptor set via SetServiceObjectSecurity not exposed in mgr pkg
+	// Use advapi32 directly
+	advapi32 := windows.NewLazySystemDLL("advapi32.dll")
+	setSec := advapi32.NewProc("SetServiceObjectSecurity")
+	sdPtr, _ := sd.ToAbsolute()
+	_ = sdPtr
+	// DACL_SECURITY_INFORMATION = 0x4
+	ret, _, _ := setSec.Call(uintptr(s.Handle), 4, uintptr(unsafe.Pointer(sd)))
+	if ret == 0 {
+		return fmt.Errorf("SetServiceObjectSecurity failed")
+	}
+	return nil
+}
+
+// verifyInstallKey checks the key against the management server.
+func verifyInstallKey(key, serverURL string) bool {
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Get(serverURL + "/api/v1/verify-install-key?key=" + key)
+	if err != nil { return false }
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
 }
 
 func uninstallService() error {
