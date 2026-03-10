@@ -31,6 +31,7 @@ type HTTPForwarder struct {
 
 // ForwarderConfig holds transport configuration.
 type ForwarderConfig struct {
+	InstallKey    string
 	BackendURL    string
 	BatchSize     int
 	FlushInterval time.Duration
@@ -98,10 +99,11 @@ func (f *HTTPForwarder) flush(ctx context.Context) {
 	}
 
 	batch := schema.Batch{
-		AgentID:  f.agentID,
-		AgentVer: f.ver,
-		SentAt:   time.Now().UTC(),
-		Events:   events,
+		AgentID:    f.agentID,
+		AgentVer:   f.ver,
+		InstallKey: f.cfg.InstallKey,
+		SentAt:     time.Now().UTC(),
+		Events:     events,
 	}
 
 	err = f.retry.Do(ctx, func() error {

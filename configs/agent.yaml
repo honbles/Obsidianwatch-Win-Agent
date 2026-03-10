@@ -35,11 +35,11 @@ collector:
       - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
 
   # DNS query/response telemetry via Microsoft-Windows-DNS-Client/Operational.
-  # No Sysmon required. The agent auto-enables this channel if it's off.
+  # No Sysmon required. The agent auto-enables this channel if it is off.
   dns:
     enabled: true
 
-  # File Integrity Monitoring — watches directories for create/modify/delete.
+  # File Integrity Monitoring - watches directories for create/modify/delete.
   fim:
     enabled: true
     dirs:
@@ -60,7 +60,7 @@ collector:
       #   recursive: true
       #   exclude: []
 
-  # Agent health heartbeat — reports queue depth, dropped events, memory usage.
+  # Agent health heartbeat - reports queue depth, dropped events, memory usage.
   health:
     enabled: true
     interval: 60s
@@ -72,7 +72,7 @@ collector:
     max_per_second: 500   # max events/sec per source
     dedupe_window: 5s     # suppress duplicate event IDs within this window
 
-  # Application log tailing — ship any log file to the SIEM backend.
+  # Application log tailing - ship any log file to the SIEM backend.
   # format: json | text | combined (apache/nginx)
   app_logs: []
 
@@ -92,13 +92,22 @@ collector:
 
 forwarder:
   backend_url: "https://192.168.1.140:8443"
+  management_url: "http://192.168.1.140"
   batch_size: 200
   flush_interval: 5s
-  # mTLS — comment out to use API key auth
+  # mTLS - comment out to use API key auth
   # cert_file: "certs/agent.crt"
   # key_file:  "certs/agent.key"
   ca_file:   "certs/ca.crt"
-  api_key: "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"
+  api_key: "changeme-generate-a-real-key-with-openssl-rand-hex-32"
+
+  # Tamper Protection - required when installing as a Windows service.
+  # Get this key from the ObsidianWatch dashboard:
+  #   Agents -> click the shield icon on your agent -> copy the Install Key
+  # Paste the key below before running the install command:
+  #   .\obsidianwatch-win-agent-V1.0.exe -config agent.yaml install
+  # Without this key the agent service cannot be uninstalled.
+  install_key: "12121212"
 
 queue:
   db_path: "C:\\ProgramData\\ObsidianWatch\\queue"

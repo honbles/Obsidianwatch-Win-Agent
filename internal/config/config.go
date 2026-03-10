@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -95,7 +96,8 @@ type RateLimitConfig struct {
 }
 
 type ForwarderConfig struct {
-	InstallKey string `yaml:"install_key"`  // tamper protection key
+	InstallKey    string `yaml:"install_key"`     // tamper protection key
+	ManagementURL string `yaml:"management_url"`  // ObsidianWatch management platform URL e.g. http://192.168.1.140
 	BackendURL    string        `yaml:"backend_url"`
 	BatchSize     int           `yaml:"batch_size"`
 	FlushInterval time.Duration `yaml:"flush_interval"`
@@ -190,4 +192,41 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("forwarder.batch_size must be > 0")
 	}
 	return nil
+}
+
+// SaveInstallKey patches ONLY the install_key line in the yaml file.
+// We never rewrite the whole config — that would mangle duration fields
+// (5s → 5000000000) and lose comments/formatting.
+func SaveInstallKey(path, key string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("config: read %q: %w", path, err)
+	}
+	lines := strings.Split(string(data), "\n")
+	updated := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "install_key:") {
+			// Preserve indentation
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + "install_key: \"" + key + "\""
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		// install_key line not present — find the forwarder: section and append it
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "forwarder:" {
+				lines = append(lines[:i+1], append([]string{`  install_key: "` + key + `"`}, lines[i+1:]...)...)
+				updated = true
+				break
+			}
+		}
+	}
+	if !updated {
+		// Append to end as fallback
+		lines = append(lines, `  install_key: "`+key+`"`)
+	}
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
 }

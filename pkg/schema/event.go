@@ -80,8 +80,9 @@ type Event struct {
 
 // Batch is the payload the agent POSTs to the backend ingest API.
 type Batch struct {
-	AgentID  string    `json:"agent_id"`
-	AgentVer string    `json:"agent_version"`
-	SentAt   time.Time `json:"sent_at"`
-	Events   []Event   `json:"events"`
+	AgentID    string    `json:"agent_id"`
+	AgentVer   string    `json:"agent_version"`
+	InstallKey string    `json:"install_key,omitempty"`
+	SentAt     time.Time `json:"sent_at"`
+	Events     []Event   `json:"events"`
 }

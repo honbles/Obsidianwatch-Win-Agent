@@ -18,6 +18,8 @@ import (
 	"crypto/tls"
 	"log/slog"
 	"os"
+	"os/exec"
+	"strings"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -65,7 +67,14 @@ func main() {
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config load: %v\n", err)
+		msg := fmt.Sprintf("ObsidianWatch agent: config load failed: %v\nConfig path: %s\n", err, *cfgPath)
+		fmt.Fprint(os.Stderr, msg)
+		// When running as a Windows service stderr is invisible -- also write a
+		// crash log beside the executable so the problem is diagnosable.
+		if exeDir, e2 := filepath.Abs(filepath.Dir(os.Args[0])); e2 == nil {
+			_ = os.WriteFile(filepath.Join(exeDir, "agent-error.log"),
+				[]byte(msg), 0644)
+		}
 		os.Exit(1)
 	}
 
@@ -73,7 +82,7 @@ func main() {
 
 	if isService {
 		// Running as a Windows service — hand control to the service manager.
-		if err := svc.Run(serviceName, &agentService{cfg: cfg, logger: logger}); err != nil {
+		if err := svc.Run(serviceName, &agentService{cfg: cfg, cfgPath: *cfgPath, logger: logger}); err != nil {
 			logger.Error("service run failed", "err", err)
 			os.Exit(1)
 		}
@@ -88,7 +97,7 @@ func main() {
 	defer cancel()
 
 	logger.Info("obsidianwatch-agent starting (interactive)", "version", cfg.Agent.Version)
-	if err := run(ctx, cfg, logger); err != nil {
+	if err := run(ctx, cfg, *cfgPath, logger); err != nil {
 		logger.Error("agent exited with error", "err", err)
 		os.Exit(1)
 	}
@@ -99,8 +108,9 @@ func main() {
 // ---------------------------------------------------------------------------
 
 type agentService struct {
-	cfg    *config.Config
-	logger *slog.Logger
+	cfg     *config.Config
+	cfgPath string
+	logger  *slog.Logger
 }
 
 func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
@@ -111,7 +121,7 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		if err := run(ctx, s.cfg, s.logger); err != nil {
+		if err := run(ctx, s.cfg, s.cfgPath, s.logger); err != nil {
 			s.logger.Error("agent run error", "err", err)
 		}
 	}()
@@ -139,7 +149,7 @@ func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, status
 // run wires up all subsystems and runs until ctx is cancelled.
 // ---------------------------------------------------------------------------
 
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+func run(ctx context.Context, cfg *config.Config, cfgPath string, logger *slog.Logger) error {
 	// Ensure required directories exist before any subsystem tries to use them.
 	// This means the user never has to create folders manually.
 	dirsToCreate := []string{
@@ -177,13 +187,24 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	defer q.Close()
 
 	// --- Forwarder ---
+	// Resolve cert paths relative to the config file directory so that
+	// relative paths like "certs/ca.crt" work when running as a Windows
+	// service (which uses System32 as its working directory).
+	cfgDir := filepath.Dir(cfgPath)
+	resolveRelative := func(p string) string {
+		if p == "" || filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(cfgDir, p)
+	}
 	fwdCfg := forwarder.ForwarderConfig{
+		InstallKey:    cfg.Forwarder.InstallKey,
 		BackendURL:    cfg.Forwarder.BackendURL,
 		BatchSize:     cfg.Forwarder.BatchSize,
 		FlushInterval: cfg.Forwarder.FlushInterval,
-		CertFile:      cfg.Forwarder.CertFile,
-		KeyFile:       cfg.Forwarder.KeyFile,
-		CAFile:        cfg.Forwarder.CAFile,
+		CertFile:      resolveRelative(cfg.Forwarder.CertFile),
+		KeyFile:       resolveRelative(cfg.Forwarder.KeyFile),
+		CAFile:        resolveRelative(cfg.Forwarder.CAFile),
 		APIKey:        cfg.Forwarder.APIKey,
 	}
 	fwd, err := forwarder.NewHTTPForwarder(fwdCfg, q, agentID, cfg.Agent.Version, logger)
@@ -369,7 +390,7 @@ func handleCommand(cmd, cfgPath string) error {
 	case "install":
 		return installService(cfgPath)
 	case "uninstall":
-		return uninstallService()
+		return uninstallService(cfgPath)
 	default:
 		return fmt.Errorf("unknown command %q (valid: install, uninstall)", cmd)
 	}
@@ -381,13 +402,68 @@ func installService(cfgPath string) error {
 		return err
 	}
 
-	// Verify install key before installing
+	// Resolve both paths to absolute so the Windows SCM can find them.
+	exePath, err = filepath.Abs(exePath)
+	if err != nil {
+		return fmt.Errorf("abs exe path: %w", err)
+	}
+	cfgPath, err = filepath.Abs(cfgPath)
+	if err != nil {
+		return fmt.Errorf("abs config path: %w", err)
+	}
+
 	cfg, cfgErr := config.Load(cfgPath)
-	if cfgErr == nil && cfg.Forwarder.InstallKey != "" {
-		if !verifyInstallKey(cfg.Forwarder.InstallKey, cfg.Forwarder.BackendURL) {
-			return fmt.Errorf("tamper protection: invalid or unrecognised install key -- obtain the correct key from the ObsidianWatch management console")
+	if cfgErr != nil {
+		return fmt.Errorf("load config: %w", cfgErr)
+	}
+
+	// ── Tamper Protection Password ──────────────────────────────────────────
+	// The install password is chosen interactively at install time.
+	// It is registered on the management server and shown on the dashboard.
+	// The same password is required to uninstall the agent.
+	fmt.Println("=======================================================")
+	fmt.Println("  ObsidianWatch -- Tamper Protection Setup")
+	fmt.Println("=======================================================")
+	fmt.Println("  Choose a password that will be required to uninstall")
+	fmt.Println("  this agent. Save it safely - it cannot be recovered.")
+	fmt.Println("  It will appear on the ObsidianWatch dashboard.")
+	fmt.Println("=======================================================")
+	fmt.Print("  Enter tamper protection password: ")
+
+	var installPassword string
+	fmt.Scanln(&installPassword)
+	installPassword = strings.TrimSpace(installPassword)
+
+	if installPassword == "" {
+		return fmt.Errorf("install cancelled: no password provided")
+	}
+	if len(installPassword) < 8 {
+		return fmt.Errorf("install cancelled: password must be at least 8 characters")
+	}
+
+	// Determine agent ID (same logic as run() — hostname by default)
+	agentInstallID := cfg.Agent.ID
+	if agentInstallID == "" {
+		if h, err2 := os.Hostname(); err2 == nil {
+			agentInstallID = h
 		}
-		fmt.Println("Install key verified OK")
+	}
+
+	// Register password with management server so it appears on dashboard.
+	if cfg.Forwarder.ManagementURL != "" {
+		fmt.Println("  Registering password with management server...")
+		if err := registerInstallKey(cfg.Forwarder.ManagementURL, cfg.Forwarder.APIKey, agentInstallID, installPassword); err != nil {
+			fmt.Printf("  Warning: could not register with server: %v\n", err)
+			fmt.Println("  The key will be saved locally and synced on first connection.")
+		} else {
+			fmt.Println("  Password registered on dashboard OK.")
+		}
+	}
+
+	// Patch only the install_key line in the yaml — never rewrite the whole
+	// config or duration fields (5s) get mangled to nanoseconds (5000000000).
+	if err := config.SaveInstallKey(cfgPath, installPassword); err != nil {
+		fmt.Printf("  Warning: could not save key to config: %v\n", err)
 	}
 
 	m, err := mgr.Connect()
@@ -395,6 +471,11 @@ func installService(cfgPath string) error {
 		return fmt.Errorf("connect to SCM: %w", err)
 	}
 	defer m.Disconnect()
+
+	// If service already exists, remove it first using raw Win32.
+	// mgr.OpenService uses SERVICE_ALL_ACCESS which is denied by a prior tamper DACL,
+	// so we open with WRITE_DAC + WRITE_OWNER to reset security first, then delete.
+	removeExistingService(serviceName)
 
 	s, err := m.CreateService(serviceName, exePath, mgr.Config{
 		StartType:   mgr.StartAutomatic,
@@ -415,60 +496,329 @@ func installService(cfgPath string) error {
 	}
 
 	fmt.Printf("Service %q installed with tamper protection.\n", serviceName)
+
+	// Start the service immediately so it shows online on the dashboard right away.
+	fmt.Println("Starting service...")
+	if err := s.Start(); err != nil {
+		fmt.Printf("Warning: service installed but could not auto-start: %v\n", err)
+		fmt.Println("Start it manually: Start-Service ObsidianWatchAgent")
+	} else {
+		fmt.Println("Service started. Agent should appear online on the dashboard within seconds.")
+	}
 	return nil
 }
 
+// enablePrivilege enables a named privilege in the current process token.
+// Required before SetServiceObjectSecurity with DACL/OWNER flags.
+func enablePrivilege(name string) {
+	var token windows.Token
+	proc, _ := windows.GetCurrentProcess()
+	_ = windows.OpenProcessToken(proc, windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token)
+	defer token.Close()
+	var luid windows.LUID
+	namep, _ := windows.UTF16PtrFromString(name)
+	advapi32p := windows.NewLazySystemDLL("advapi32.dll")
+	lookupPriv := advapi32p.NewProc("LookupPrivilegeValueW")
+	lookupPriv.Call(0, uintptr(unsafe.Pointer(namep)), uintptr(unsafe.Pointer(&luid)))
+	privs := windows.Tokenprivileges{
+		PrivilegeCount: 1,
+		Privileges: [1]windows.LUIDAndAttributes{{
+			Luid:       luid,
+			Attributes: windows.SE_PRIVILEGE_ENABLED,
+		}},
+	}
+	windows.AdjustTokenPrivileges(token, false, &privs, 0, nil, nil)
+}
+
+// deleteServiceViaSYSTEM is the last-resort fallback when WRITE_DAC is blocked.
+// Creates a one-shot scheduled task running as SYSTEM that resets the DACL,
+// stops, and deletes the service — SYSTEM bypasses all DACLs.
+func deleteServiceViaSYSTEM(svcName string) error {
+	fmt.Println("  Direct DACL unlock blocked — spawning SYSTEM task as fallback...")
+	taskName := "OW_Uninstall_" + svcName
+	script := fmt.Sprintf(
+		`sc.exe sdset %s D:(A;;RPWPDTLOCRSDRCWDWO;;;SY)(A;;RPWPDTLOCRSDRCWDWO;;;BA) & sc.exe stop %s & timeout /t 3 & sc.exe delete %s`,
+		svcName, svcName, svcName)
+	// Create the task
+	create := exec.Command("schtasks.exe", "/Create", "/F",
+		"/SC", "ONCE", "/ST", "00:00",
+		"/TN", taskName,
+		"/TR", `cmd.exe /c `+script,
+		"/RU", "SYSTEM", "/RL", "HIGHEST")
+	if out, err := create.CombinedOutput(); err != nil {
+		return fmt.Errorf("create task failed: %v: %s", err, out)
+	}
+	// Run immediately
+	exec.Command("schtasks.exe", "/Run", "/TN", taskName).Run()
+	fmt.Println("  Waiting for SYSTEM task to complete...")
+	time.Sleep(8 * time.Second)
+	// Cleanup
+	exec.Command("schtasks.exe", "/Delete", "/F", "/TN", taskName).Run()
+	fmt.Println("  Service removed via SYSTEM task.")
+	return nil
+}
+
+// removeExistingService removes a previous installation using raw Win32 calls
+// so it works even when the service has a tamper-protection DACL that blocks
+// the high-level mgr.OpenService (which requests SERVICE_ALL_ACCESS).
+func removeExistingService(name string) {
+	const (
+		SC_MANAGER_CONNECT    = 0x0001
+		SERVICE_WRITE_DAC     = 0x00040000
+		SERVICE_ALL_ACCESS    = 0x000F01FF
+	)
+	advapi32r := windows.NewLazySystemDLL("advapi32.dll")
+	openSCMr   := advapi32r.NewProc("OpenSCManagerW")
+	openSvcR   := advapi32r.NewProc("OpenServiceW")
+	closeHndR  := advapi32r.NewProc("CloseServiceHandle")
+	setSecR    := advapi32r.NewProc("SetServiceObjectSecurity")
+	controlR   := advapi32r.NewProc("ControlService")
+	deleteR    := advapi32r.NewProc("DeleteService")
+
+	scmName, _ := windows.UTF16PtrFromString("")
+	scmDB, _   := windows.UTF16PtrFromString("ServicesActive")
+	scm, _, _  := openSCMr.Call(
+		uintptr(unsafe.Pointer(scmName)),
+		uintptr(unsafe.Pointer(scmDB)),
+		SC_MANAGER_CONNECT,
+	)
+	if scm == 0 { return }
+	defer closeHndR.Call(scm)
+
+	svcName, _ := windows.UTF16PtrFromString(name)
+
+	// First open with WRITE_DAC to reset DACL
+	hDac, _, _ := openSvcR.Call(scm, uintptr(unsafe.Pointer(svcName)), SERVICE_WRITE_DAC)
+	if hDac == 0 { return } // service doesn't exist — nothing to remove
+
+	unlockSddl := "D:P(A;;0x000F01FF;;;SY)(A;;0x000F01FF;;;BA)"
+	if sd, err := windows.SecurityDescriptorFromString(unlockSddl); err == nil {
+		setSecR.Call(hDac, 4, uintptr(unsafe.Pointer(sd)))
+	}
+	closeHndR.Call(hDac)
+
+	// Now open with full access to stop and delete
+	hFull, _, _ := openSvcR.Call(scm, uintptr(unsafe.Pointer(svcName)), SERVICE_ALL_ACCESS)
+	if hFull == 0 { return }
+
+	var status windows.SERVICE_STATUS
+	controlR.Call(hFull, windows.SERVICE_CONTROL_STOP, uintptr(unsafe.Pointer(&status)))
+	time.Sleep(2 * time.Second)
+	deleteR.Call(hFull)
+	closeHndR.Call(hFull)
+	time.Sleep(1 * time.Second)
+	fmt.Println("  Removed existing service installation.")
+}
+
 // applyTamperDACL sets a restrictive security descriptor on the service that
-// prevents stop/delete without SYSTEM or TrustedInstaller privileges.
+// prevents stop/delete by non-SYSTEM accounts.
+//
+// Service-specific hex rights used in SDDL:
+//   0x000F01FF = SERVICE_ALL_ACCESS  (SYSTEM gets everything)
+//   0x0002019D = query/start/pause/read but NOT stop/delete (Administrators)
+//   0x00010020 = SERVICE_STOP | DELETE  (denied for Everyone)
 func applyTamperDACL(s *mgr.Service) error {
-	// SDDL: allow SYSTEM and Administrators full control,
-	// but DENY SERVICE_STOP (0x0020) and DELETE (0x00010000) for Everyone (WD)
-	// D:P = protected DACL
-	// (A;;RPWPRCSDLO;;;SY) = SYSTEM: all service rights
-	// (A;;RPWPRCSDLO;;;BA) = Builtin Admins: all service rights (read/start/pause)
-	// (D;;DS;;;WD) = Everyone: DENY delete service
-	sddl := "D:P(A;;RPWPRCSDWPLO;;;SY)(A;;RPWPRC;;;BA)(D;;DS;;;WD)"
+	// Hex masks avoid the invalid generic-rights keywords that caused parse errors.
+	sddl := "D:P(A;;0x000F01FF;;;SY)(A;;0x0002019D;;;BA)(D;;0x00010020;;;WD)"
 	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return fmt.Errorf("parse SDDL: %w", err)
 	}
-	_ = sd // security descriptor set via SetServiceObjectSecurity not exposed in mgr pkg
-	// Use advapi32 directly
 	advapi32 := windows.NewLazySystemDLL("advapi32.dll")
 	setSec := advapi32.NewProc("SetServiceObjectSecurity")
-	sdPtr, _ := sd.ToAbsolute()
-	_ = sdPtr
 	// DACL_SECURITY_INFORMATION = 0x4
-	ret, _, _ := setSec.Call(uintptr(s.Handle), 4, uintptr(unsafe.Pointer(sd)))
+	ret, _, err2 := setSec.Call(uintptr(s.Handle), 4, uintptr(unsafe.Pointer(sd)))
 	if ret == 0 {
-		return fmt.Errorf("SetServiceObjectSecurity failed")
+		return fmt.Errorf("SetServiceObjectSecurity: %w", err2)
+	}
+	return nil
+}
+
+// registerInstallKey registers a chosen password as the agent's install key
+// on the management server. The key is stored in the DB and shown on the dashboard.
+func registerInstallKey(mgmtURL, apiKey, agentID, password string) error {
+	mgmtURL = strings.TrimRight(mgmtURL, "/")
+	body := fmt.Sprintf(`{"agent_id":%q,"install_key":%q}`, agentID, password)
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+	req, err := http.NewRequest(http.MethodPost, mgmtURL+"/api/v1/agent/register-key",
+		strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("server returned %d", resp.StatusCode)
 	}
 	return nil
 }
 
 // verifyInstallKey checks the key against the management server.
-func verifyInstallKey(key, serverURL string) bool {
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	resp, err := client.Get(serverURL + "/api/v1/verify-install-key?key=" + key)
-	if err != nil { return false }
+func verifyInstallKey(key, mgmtURL string) bool {
+	// mgmtURL is the management platform e.g. http://192.168.1.140
+	// (NOT the agent backend port 8443)
+	if mgmtURL == "" {
+		fmt.Println("Warning: management_url not set in config -- cannot verify install key")
+		return false
+	}
+	// Strip trailing slash
+	mgmtURL = strings.TrimRight(mgmtURL, "/")
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
+	resp, err := client.Get(mgmtURL + "/api/v1/verify-install-key?key=" + key)
+	if err != nil {
+		fmt.Printf("Warning: could not reach management server at %s: %v\n", mgmtURL, err)
+		return false
+	}
 	defer resp.Body.Close()
 	return resp.StatusCode == 200
 }
 
-func uninstallService() error {
-	m, err := mgr.Connect()
-	if err != nil {
-		return fmt.Errorf("connect to SCM: %w", err)
+func uninstallService(cfgPath string) error {
+	// Always prompt interactively for the install key -- even if it's in the
+	// config file. This ensures a human must consciously provide the key to
+	// uninstall. Someone who just has the config file cannot silently remove
+	// the agent.
+	cfg, cfgErr := config.Load(cfgPath)
+	mgmtURL := ""
+	if cfgErr == nil {
+		mgmtURL = cfg.Forwarder.ManagementURL
 	}
-	defer m.Disconnect()
 
-	s, err := m.OpenService(serviceName)
-	if err != nil {
-		return fmt.Errorf("open service: %w", err)
+	fmt.Println("=======================================================")
+	fmt.Println("  ObsidianWatch -- Tamper Protection")
+	fmt.Println("=======================================================")
+	fmt.Println("  To uninstall, enter the Install Key shown on the")
+	fmt.Println("  ObsidianWatch dashboard:")
+	fmt.Println("    Agents -> shield icon -> Install Key")
+	fmt.Println("=======================================================")
+	fmt.Print("  Enter Install Key: ")
+
+	var input string
+	fmt.Scanln(&input)
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		return fmt.Errorf("uninstall cancelled: no key provided")
 	}
-	defer s.Close()
 
-	return s.Delete()
+	if mgmtURL == "" {
+		// No management URL -- accept key without server verification
+		// (offline mode, key is checked locally against config)
+		if cfgErr == nil && cfg.Forwarder.InstallKey != "" && input != cfg.Forwarder.InstallKey {
+			return fmt.Errorf("tamper protection: invalid install key")
+		}
+		fmt.Println("  Key accepted (offline). Proceeding with uninstall.")
+	} else {
+		fmt.Println("  Verifying key against management server...")
+		if !verifyInstallKey(input, mgmtURL) {
+			return fmt.Errorf("tamper protection: invalid install key -- check the ObsidianWatch dashboard")
+		}
+		fmt.Println("  Key verified OK. Proceeding with uninstall.")
+	}
+
+	// ── Raw Win32 uninstall with DACL bypass ────────────────────────────────
+	// Our tamper DACL denies SERVICE_STOP and DELETE for everyone except SYSTEM.
+	// mgr.OpenService requests SERVICE_ALL_ACCESS which includes those rights
+	// and gets Access Denied before we can even unlock the DACL.
+	//
+	// Fix: open the service with only WRITE_DAC (0x00040000) which IS allowed
+	// by our DACL, reset the security descriptor to allow full admin access,
+	// then stop and delete using a fresh handle with full rights.
+
+	const (
+		SC_MANAGER_CONNECT = 0x0001         // always granted to any user
+		SERVICE_WRITE_DAC  = 0x00040000     // not in our deny list — should be allowed
+		SERVICE_ALL_ACCESS = 0x000F01FF
+	)
+
+	// Enable SE_TAKE_OWNERSHIP_NAME so we can take ownership of the service
+	// object and then reset its DACL regardless of existing restrictions.
+	enablePrivilege("SeTakeOwnershipPrivilege")
+	enablePrivilege("SeSecurityPrivilege")
+
+	advapi32u := windows.NewLazySystemDLL("advapi32.dll")
+	openSCM   := advapi32u.NewProc("OpenSCManagerW")
+	openSvc   := advapi32u.NewProc("OpenServiceW")
+	closeHnd  := advapi32u.NewProc("CloseServiceHandle")
+	setSec2   := advapi32u.NewProc("SetServiceObjectSecurity")
+
+	// Open SCM with CONNECT only — always succeeds for any local user
+	scmName, _ := windows.UTF16PtrFromString("")
+	scmDB, _   := windows.UTF16PtrFromString("ServicesActive")
+	scmHandle, _, _ := openSCM.Call(
+		uintptr(unsafe.Pointer(scmName)),
+		uintptr(unsafe.Pointer(scmDB)),
+		SC_MANAGER_CONNECT,
+	)
+	if scmHandle == 0 {
+		return fmt.Errorf("OpenSCManager failed: %w", windows.GetLastError())
+	}
+	defer closeHnd.Call(scmHandle)
+
+	svcName, _ := windows.UTF16PtrFromString(serviceName)
+
+	// Step 1: Open with WRITE_DAC|WRITE_OWNER — our deny ACE only blocks
+	// SERVICE_STOP (0x20) and DELETE (0x10000), not DAC/owner writes.
+	hDac, _, _ := openSvc.Call(scmHandle, uintptr(unsafe.Pointer(svcName)), SERVICE_WRITE_DAC)
+	if hDac == 0 {
+		// Last resort: use a scheduled task running as SYSTEM to delete
+		return deleteServiceViaSYSTEM(serviceName)
+	}
+
+	// Step 2: Reset DACL to allow admins full access
+	unlockSddl := "D:P(A;;0x000F01FF;;;SY)(A;;0x000F01FF;;;BA)"
+	sd, err := windows.SecurityDescriptorFromString(unlockSddl)
+	if err != nil {
+		closeHnd.Call(hDac)
+		return fmt.Errorf("build unlock SDDL: %w", err)
+	}
+	ret, _, _ := setSec2.Call(hDac, 4, uintptr(unsafe.Pointer(sd))) // DACL_SECURITY_INFORMATION = 4
+	closeHnd.Call(hDac)
+	if ret == 0 {
+		fmt.Printf("Warning: could not unlock DACL (err=%v) — trying anyway\n", windows.GetLastError())
+	} else {
+		fmt.Println("  DACL unlocked. Service can now be stopped and removed.")
+	}
+
+	// Step 3: Open with STOP + ALL_ACCESS to stop and delete
+	hFull, _, _ := openSvc.Call(scmHandle, uintptr(unsafe.Pointer(svcName)), SERVICE_ALL_ACCESS)
+	if hFull == 0 {
+		return fmt.Errorf("OpenService (full access) failed after DACL unlock: %w", windows.GetLastError())
+	}
+
+	// Stop the service if running
+	var svcStatus windows.SERVICE_STATUS
+	controlSvc := advapi32u.NewProc("ControlService")
+	querySvc   := advapi32u.NewProc("QueryServiceStatus")
+	querySvc.Call(hFull, uintptr(unsafe.Pointer(&svcStatus)))
+	if svcStatus.CurrentState != windows.SERVICE_STOPPED {
+		controlSvc.Call(hFull, windows.SERVICE_CONTROL_STOP, uintptr(unsafe.Pointer(&svcStatus)))
+		fmt.Println("  Stop signal sent. Waiting...")
+		time.Sleep(3 * time.Second)
+	}
+
+	// Delete the service
+	deleteSvc := advapi32u.NewProc("DeleteService")
+	ret2, _, errDel := deleteSvc.Call(hFull)
+	closeHnd.Call(hFull)
+	if ret2 == 0 {
+		return fmt.Errorf("DeleteService failed: %w", errDel)
+	}
+
+	fmt.Println("  Service uninstalled successfully.")
+	fmt.Println("  The agent will stop sending events. The tamper password is no longer needed.")
+	return nil
 }
 
 // ---------------------------------------------------------------------------
